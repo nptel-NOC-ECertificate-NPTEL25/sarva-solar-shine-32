@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { z } from "zod";
-import { db } from "@/src/firebase";
+import { db } from "../firebase"; // ✅ NO @ alias
 import { collection, addDoc } from "firebase/firestore";
-import emailjs from "emailjs-com";
+import emailjs from "@emailjs/browser";
 
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -21,8 +21,8 @@ import { toast } from "@/hooks/use-toast";
 
 const schema = z.object({
   name: z.string().trim().min(2, "Enter your name"),
-  phone: z.string().trim().regex(/^[6-9]\d{9}$/, "Enter valid 10-digit phone"),
-  email: z.string().email("Invalid email").optional().or(z.literal("")),
+  phone: z.string().trim().regex(/^[6-9]\d{9}$/, "Enter valid phone"),
+  email: z.string().email().optional().or(z.literal("")),
   service: z.string().min(1, "Select a service"),
   city: z.string().optional(),
   message: z.string().optional()
@@ -51,7 +51,7 @@ export default function LeadForm() {
   });
 
   const update = (k: string, v: string) => {
-    setForm({ ...form, [k]: v });
+    setForm((prev) => ({ ...prev, [k]: v }));
   };
 
   const onSubmit = async (e: React.FormEvent) => {
@@ -82,7 +82,14 @@ export default function LeadForm() {
       await emailjs.send(
         "YOUR_SERVICE_ID",
         "YOUR_TEMPLATE_ID",
-        form,
+        {
+          name: form.name,
+          phone: form.phone,
+          email: form.email,
+          service: form.service,
+          city: form.city,
+          message: form.message
+        },
         "YOUR_PUBLIC_KEY"
       );
 
@@ -94,10 +101,10 @@ export default function LeadForm() {
       });
 
     } catch (err) {
-      console.error(err);
+      console.error("Submission error:", err);
       toast({
         title: "Error",
-        description: "Something went wrong"
+        description: "Submission failed. Try again."
       });
     }
 
