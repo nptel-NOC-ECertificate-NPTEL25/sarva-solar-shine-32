@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { z } from "zod";
-import { db } from "@/firebase";
+import { db } from "@/src/firebase";
 import { collection, addDoc } from "firebase/firestore";
 import emailjs from "emailjs-com";
 
