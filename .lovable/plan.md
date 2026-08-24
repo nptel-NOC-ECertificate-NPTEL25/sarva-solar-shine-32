@@ -1,66 +1,139 @@
-# Sarva Solar → Production CMS Platform
+# Phase 1 — Supabase-backed production architecture
 
-## Current state (verified)
+## Build is currently broken (blocking)
 
-- Vite + React 18 + TS SPA, 8 static pages (`Index`, `Residential`, `Commercial`, `Pumps`, `Projects`, `About`, `Contact`, `NotFound`), shadcn UI, Tailwind design tokens.
-- All content is hard-coded: `src/lib/site.ts` (contact/social), `src/data/projects.ts` (portfolio + imported JPGs), inline copy in every page, `SavingsCalculator.tsx` constants (tariff 8.5, sun hours 5.2, ₹60,000/kW, degradation, 25 yrs).
-- `LeadForm.tsx` validates with zod but **does not persist** — it fakes a 700ms delay and shows a success card.
-- Lovable Cloud (Supabase) is enabled but empty: no `supabase/migrations/`, no `src/integrations/supabase/types.ts`, no tables, no auth, no storage buckets, no edge functions.
-- SEO: `index.html` has title/description/OG/LocalBusiness JSON-LD; `SEO.tsx` sets per-route head tags client-side. No sitemap.xml generation, no dynamic-route SEO.
+`src/components/LeadForm.tsx` now imports `db` from `src/firebase.ts`, but that file only initialises Firebase and analytics — it exports nothing. Rollup fails with "db is not exported by src/firebase.ts". The missing packages (`firebase`, `@emailjs/browser`) are now installed, so this export is the only remaining break. Plan mode cannot edit source, so the very first action after approval is to remove the Firebase/EmailJS lead path entirely and route lead submission through Supabase (details below). Firebase config with live keys is committed in `src/firebase.ts`; it will be deleted, not extended.
 
-Gap vs spec: everything except the visual shell and form validation is missing — no CMS, no persistence, no auth/RLS, no media pipeline, no CRM, no audit logs.
+## Audit of the existing codebase
 
-## Architectural conflicts to resolve up front
+**Stack:** Vite 5 + React 18 + TS + Tailwind + shadcn/ui, React Router, TanStack Query (installed, unused), zod. Supabase client exists at `src/integrations/supabase/client.ts` but `./types` is not generated yet and no table exists. No Express, no server code, no compelling dependency on a long-running Node process.
 
-1. **Express/TypeScript API vs this platform.** This project deploys as a static SPA on Lovable's CDN; there is no long-running Node process, so an Express server cannot be hosted here (same constraint applies on Vercel — you'd need serverless functions or a separate always-on host like Render/Fly, adding a second deploy target, CORS, and its own secrets).
-   **Proposal (simplest production-safe):** keep a single deploy target. Use **Supabase Postgres + RLS as the primary API** (typed client, row-level authorization enforced by the database), and **Supabase Edge Functions (Deno) for every trusted server-side operation** — lead intake with rate limiting, quote PDF/email, admin bulk actions, sitemap generation, revalidation. Edge functions can be written in Express-style route handlers (Hono) if the Express ergonomics matter. If you later require a true Express service, it can be added as a separate repo consuming the same Supabase DB with a service role — nothing in this plan blocks that.
-2. **Client-side SEO on an SPA.** `SEO.tsx` mutates the DOM after hydration; crawlers that don't execute JS see only `index.html`. Fix pragmatically: keep react-helmet-style head management, add a **build-time prerender step** (`vite-plugin-prerender`/static route snapshot) for public routes, plus a **DB-driven `sitemap.xml` + `robots.txt`** served by an edge function.
-3. **"No localStorage as source of truth."** Auth session storage in localStorage stays (that's Supabase's session, not content). Everything else reads from the DB.
+**Routing:** `/`, `/residential`, `/commercial`, `/pumps`, `/projects`, `/about`, `/contact`, `*` — all wrapped in `SiteLayout` (Header, Footer, WhatsAppFab, scroll-to-top). No `/admin`, no auth guard.
 
-## Data model (Supabase, all in `public`, RLS on, GRANTs per table)
+**Hard-coded / mock content to migrate:**
+| Source | Content |
+|---|---|
+| `src/lib/site.ts` | name, tagline, phone, WhatsApp, email, address, map embed, social links |
+| `src/data/projects.ts` | 8 projects + imported JPG assets |
+| `src/components/Testimonials.tsx` | testimonials |
+| `src/components/TrustStats.tsx` | statistics |
+| `src/components/ServiceCard.tsx` + pages | services, features, FAQ copy, subsidy copy |
+| `src/pages/*.tsx` | all hero, section and SEO copy |
+| `index.html` | title/OG/LocalBusiness JSON-LD with placeholder phone/URL |
+| `src/components/SavingsCalculator.tsx` | TARIFF 8.5, SUN_HOURS 5.2, COST_PER_KW 60000, DEGRADATION 0.005, YEARS 25, 92% offset, CO₂ factor |
 
-- `profiles` (id → auth user, name, phone, avatar)
-- `user_roles` + `app_role` enum (`admin`, `editor`, `sales`, `viewer`) + `has_role()` security-definer function — roles never on profiles
-- Content: `pages`, `page_sections` (typed JSONB blocks), `site_settings` (singleton: contact, social, map, hours), `navigation_items`
-- Catalog: `products` (panels/inverters/pumps, specs JSONB, price), `product_categories`, `services`
-- Portfolio: `projects` (category, size, location, gallery), `testimonials`
-- Marketing: `blog_posts` (slug, MDX/HTML body, status, published_at), `blog_categories`, `careers` (+ `job_applications`), `faqs`, `subsidy_schemes` (PM Surya Ghar tiers, editable rates)
-- CRM: `leads` (source, status pipeline, assigned_to, UTM), `lead_notes`, `lead_activities`, `quotes` (line items JSONB, totals, status), `quote_items`
-- Calculator: `calculator_settings` (tariff, sun hours, ₹/kW by size band, degradation, offset %, CO₂ factor) — read publicly, written by admin
-- Ops: `audit_logs` (actor, table, row, action, diff), `media_assets` (storage path, alt, dimensions)
-- Storage buckets: `media` (public read, admin write), `documents` (private, signed URLs for quotes/CVs)
+**Forms:** one — `LeadForm` (zod validated, currently Firestore + EmailJS). No careers, quote or application forms.
 
-RLS shape: public `SELECT` only on published content (`status = 'published'`); all writes require `has_role(auth.uid(),'admin'|'editor')`; `leads`/`quotes` insert allowed to `anon` **only via edge function** (service role), never direct; every admin table gets an audit trigger.
+**Reusable UI worth preserving:** full shadcn set, `SiteLayout`/`Header`/`Footer`/`WhatsAppFab`, `PageHero`, `ServiceCard`, `CtaBanner`, `SEO`, `SavingsCalculator` shell, `useCountUp`. These stay; only their data sources change (props/hooks instead of literals), plus a brand-token pass to the specified green/amber/slate palette.
 
-## Edge functions
+## Architecture decision
 
-- `submit-lead` — zod validation, IP+phone rate limit, honeypot, UTM capture, writes lead, sends notification email
-- `submit-application` — careers CV upload + record
-- `generate-quote` — builds quote from products + calculator settings, stores PDF in `documents`
-- `sitemap` — DB-driven XML
-- `admin-bulk` — guarded destructive/bulk ops with role check in code
+No Express. There is no technical dependency requiring it, and a long-running server would need a second always-on host (Vercel/Lovable serve static output only), a second deploy pipeline, CORS surface and its own secret store. Instead:
 
-## Admin CMS (`/admin`)
+- **Supabase Postgres + RLS** = the API for all reads and authenticated writes, via the typed client.
+- **Supabase Edge Functions (Deno)** = the trusted server tier for anything that must not be client-trusted: public lead/application intake with rate limiting, quote generation, notification emails, sitemap, bulk/destructive admin ops. Service role never leaves the server.
+- Deployment stays a single static SPA build — Vercel-compatible.
 
-Protected shell (auth guard + role guard, server-enforced by RLS): Dashboard (lead funnel, conversion, revenue), Leads (kanban + detail, notes, assignment), Quotes builder, Products, Projects, Blog editor, Careers + applications, Testimonials/FAQs, Pages & sections editor, Media library (upload/crop/alt), Calculator settings, Subsidy schemes, Site settings, Users & roles, Audit log viewer.
+## Schema (all `public`, normalized, RLS on, GRANTs in the same migration)
 
-## Public site rework
+**Identity & access**
+- `profiles` (user_id → auth.users, full_name, phone, avatar_url, is_active)
+- `app_role` enum: `super_admin | admin | content_manager | crm_staff`
+- `user_roles` (user_id, role, unique) + `has_role(_user_id, _role)` and `is_staff(_user_id)` security-definer functions. Roles never stored on profiles.
 
-Rebuild pages to render from DB (with typed loaders + React Query, skeletons, ISR-ish caching). New/changed routes: `/`, `/services/:slug`, `/products`, `/products/:slug`, `/projects`, `/projects/:slug`, `/subsidy`, `/blog`, `/blog/:slug`, `/careers`, `/careers/:slug`, `/about`, `/contact`, `/quote`. Visual direction is re-derived from a fresh design system (tokens in `index.css`); no hard-coded copy, colors chosen deliberately rather than inherited.
+**Site & content**
+- `site_settings` (singleton key/value-typed row: brand, tagline, phone, whatsapp, email, addresses, hours, map, social, footer)
+- `branches` (name, address, city, phone, geo)
+- `navigation_items` (label, href, parent_id, sort_order, location: header/footer, is_active)
+- `pages` (slug, title, status, seo_title, seo_description, og_image_id, canonical)
+- `page_sections` (page_id, type, sort_order, content JSONB, is_active)
+- `hero_slides` (page_id, headline, subheadline, media_id, cta_label, cta_href, sort_order)
+- `statistics` (label, value, suffix, icon, sort_order)
 
-## Phasing
+**Catalog & portfolio**
+- `service_categories`, `services` (slug, name, summary, body, icon, hero_media_id, status)
+- `product_categories`, `products` (slug, name, brand, category_id, specs JSONB, price, warranty_years, status), `product_media` (join → `media_assets`)
+- `projects` (slug, title, category, capacity_kw, location, branch_id, commissioned_on, summary, status), `project_media` (join)
+- `testimonials` (name, location, rating, quote, project_id, media_id, status)
+- `gallery_items` (media_id, title, tags, sort_order)
+- `faqs` (question, answer, category, sort_order, status)
 
-1. **Foundation** — schema migrations (all tables, GRANTs, RLS, roles, audit triggers), storage buckets, seed from existing hard-coded content so nothing is lost.
-2. **Auth + admin shell** — email/password + Google, role guards, layout, dashboard skeleton.
-3. **CMS modules** — settings, pages/sections, media, products, projects, testimonials, FAQs, calculator, subsidy.
-4. **Lead/CRM** — `submit-lead` function + rate limiting, wire `LeadForm`, leads pipeline, quotes builder, notifications.
-5. **Blog + careers** — editors, public listings/details, applications.
-6. **Public rebuild** — all pages DB-driven, new design system, dynamic calculator.
-7. **SEO + hardening** — prerender, sitemap/robots, per-route JSON-LD, security scan + linter pass, RLS test matrix, performance budget, deployment checks.
+**Marketing & careers**
+- `blog_categories`, `blog_posts` (slug, title, excerpt, body, cover_media_id, author_id, status, published_at, seo fields), `blog_post_categories` (join)
+- `jobs` (slug, title, department, location, type, description, status, closes_on)
+- `job_applications` (job_id, name, email, phone, resume_path, cover_note, status) — private
 
-## Decisions I need from you
+**CRM**
+- `leads` (name, phone, email, city, service_id, message, source, utm JSONB, status enum, assigned_to, ip_hash) — private
+- `lead_notes`, `lead_activities` (actor, type, payload)
+- `quotes` (lead_id, quote_no, system_kw, subtotal, subsidy_amount, total, status, valid_until, pdf_path)
+- `quote_items` (quote_id, product_id, description, qty, unit_price, line_total)
 
-1. Confirm the **Supabase + Edge Functions** architecture (no separate Express host) — or name the host you want for Express.
-2. Design direction: keep the current green/yellow brand as a starting point, or a clean-slate direction (share references if any)?
-3. Lead notification channel: email only, or email + WhatsApp/SMS (needs a provider + secret)?
-4. Blog editor: rich text (TipTap) or markdown?
+**Policy / calculator**
+- `calculator_settings` (singleton: default_tariff, sun_hours, degradation_pct, offset_pct, co2_factor, years, is_active + versioned history)
+- `calculator_cost_slabs` (min_kw, max_kw, cost_per_kw) — sizing/pricing bands
+- `subsidy_schemes` (name, authority, effective_from/to, status) + `subsidy_slabs` (scheme_id, min_kw, max_kw, amount or per_kw rate, cap)
+
+**Ops**
+- `media_assets` (bucket, path, mime, width, height, size, alt_text, uploaded_by)
+- `audit_logs` (actor_id, action, entity_table, entity_id, before JSONB, after JSONB, ip, created_at)
+
+Every table gets `created_at`/`updated_at` with a shared `update_updated_at_column()` trigger.
+
+## RLS strategy
+
+- **Public (`anon`) read only where explicitly published:** `status = 'published'`/`is_active = true` on pages, sections, hero slides, services, products, projects, testimonials, FAQs, gallery, blog posts (and `published_at <= now()`), jobs, subsidy schemes/slabs, navigation, statistics, branches, site_settings, calculator settings/slabs, media_assets in the public bucket. `GRANT SELECT ... TO anon` only on those.
+- **Public writes: none.** `leads`, `job_applications` accept no direct anon insert; intake goes through edge functions using the service role after validation + rate limiting.
+- **Staff:** all content tables writable by `content_manager`+; CRM tables readable/writable by `crm_staff`+; `user_roles`, `site_settings`, `audit_logs` restricted to `admin`/`super_admin`; role changes to `super_admin` only. All checks via `has_role()` to avoid recursive policy evaluation.
+- **Audit logs:** insert only by triggers/service role, read by admins, no update/delete.
+- Row-level ownership where relevant (`assigned_to` for CRM staff scoping, `author_id` for drafts).
+
+## Storage
+
+- `media` — public read, staff write (images: hero, products, projects, blog, gallery)
+- `documents` — private, signed URLs (quote PDFs, brochures)
+- `resumes` — private, write via edge function only, read by CRM staff
+Upload validation (mime + size) on the client and re-checked server-side; `media_assets` rows created in the same operation and a cleanup routine removes orphans.
+
+## Audit logging
+
+Generic `audit_trigger()` (security definer) attached to every content, CRM, settings and role table: captures actor `auth.uid()`, action, table, row id and before/after JSONB. Edge-function actions log explicitly with the acting user resolved from the verified JWT.
+
+## Calculator model
+
+`SavingsCalculator` reads `calculator_settings` + `calculator_cost_slabs` + active `subsidy_schemes/slabs` via React Query (cached, with safe fallbacks). No policy or pricing constant remains in code. The quote-generating math lives in an edge function so displayed prices can't be tampered with client-side.
+
+## Security risks and mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Firebase API keys + unsecured Firestore writes committed in repo | Delete `src/firebase.ts`, remove firebase/EmailJS deps; rotate/disable that Firebase project |
+| Public spam into `leads` | Edge function only: zod validation, honeypot, per-IP/phone rate limit table, no anon insert grant |
+| Lead/quote/applicant data exposure | Private tables, no anon GRANT, staff-scoped policies, resumes in private bucket with signed URLs |
+| Privilege escalation | Roles in separate `user_roles` table, `has_role()` security definer, role writes restricted to super_admin, never trust client role claims |
+| Tampered prices/subsidies | Totals computed server-side in the quote function against DB slabs |
+| XSS via rich text | Sanitize on write and render (DOMPurify), restricted tag allowlist |
+| Malicious uploads | Mime/size/extension allowlist, private-by-default buckets, no executable types |
+| Secret leakage | Service role only inside edge functions; client uses publishable key |
+| Enumeration / abuse of functions | JWT verification in code for admin functions, CORS allowlist, rate limits, generic error responses |
+
+## Migration sequence
+
+1. `update_updated_at_column`, `app_role`, `user_roles`, `profiles`, `has_role`/`is_staff`, signup trigger, `audit_logs` + `audit_trigger()`
+2. `media_assets` + buckets + storage policies
+3. Site core: `site_settings`, `branches`, `navigation_items`, `statistics`, `pages`, `page_sections`, `hero_slides`
+4. Catalog: services, products (+categories, media joins), projects, testimonials, gallery, faqs
+5. Policy: `calculator_settings`, `calculator_cost_slabs`, `subsidy_schemes`, `subsidy_slabs`
+6. CRM: `leads`, `lead_notes`, `lead_activities`, `quotes`, `quote_items`
+7. Marketing/careers: blog tables, `jobs`, `job_applications`
+8. Attach audit triggers to all of the above; seed every current hard-coded value (site.ts, projects.ts, testimonials, stats, calculator constants, page copy) so nothing is lost
+9. Edge functions: `submit-lead`, `submit-application`, `generate-quote`, `sitemap`
+10. Frontend rewiring: delete Firebase path, typed hooks per entity, pages read from DB, calculator from settings, SEO from `pages`
+
+Phase 1 ends when the public site renders entirely from Supabase and the lead form persists securely. Admin CMS screens and the CRM UI are Phase 2, built on this schema.
+
+## Confirmations needed
+
+1. Firebase project `sarva-group-of-companys` — safe to remove from this codebase (and should its Firestore writes be locked down separately)?
+2. Lead notifications: email via edge function (Resend), or also WhatsApp/SMS (needs a provider + secret)?
+3. Should Phase 1 also apply the specified green/amber/slate brand tokens, or keep the current palette until Phase 2?
