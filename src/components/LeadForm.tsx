@@ -1,8 +1,6 @@
 import { useState } from "react";
 import { z } from "zod";
-import { db } from "../firebase"; // ✅ NO @ alias
-import { collection, addDoc } from "firebase/firestore";
-import emailjs from "@emailjs/browser";
+import { supabase } from "@/integrations/supabase/client";
 
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -13,56 +11,67 @@ import {
   SelectContent,
   SelectItem,
   SelectTrigger,
-  SelectValue
+  SelectValue,
 } from "@/components/ui/select";
 
 import { Send, CheckCircle2 } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
+import { useServices } from "@/hooks/usePublicContent";
 
 const schema = z.object({
-  name: z.string().trim().min(2, "Enter your name"),
-  phone: z.string().trim().regex(/^[6-9]\d{9}$/, "Enter valid phone"),
-  email: z.string().email().optional().or(z.literal("")),
-  service: z.string().min(1, "Select a service"),
-  city: z.string().optional(),
-  message: z.string().optional()
+  name: z.string().trim().min(2, "Enter your name").max(120),
+  phone: z.string().trim().regex(/^[6-9]\d{9}$/, "Enter valid 10-digit phone"),
+  email: z.string().email("Enter a valid email").max(200).optional().or(z.literal("")),
+  service: z.string().min(1, "Select a service").max(120),
+  city: z.string().max(120).optional(),
+  message: z.string().max(2000).optional(),
 });
 
-const SERVICES = [
+const FALLBACK_SERVICES = [
   "Residential Solar",
   "Commercial Solar",
   "Solar Pump",
   "Water Heater",
-  "Other"
+  "Other",
 ];
 
-export default function LeadForm() {
+export default function LeadForm({
+  source = "website",
+  defaultService = "",
+}: {
+  source?: string;
+  defaultService?: string;
+}) {
   const [submitted, setSubmitted] = useState(false);
-  const [errors, setErrors] = useState<any>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
+  const { data: services } = useServices();
+
+  const options = services?.length
+    ? Array.from(new Set([...services.map((s) => s.name), ...(defaultService ? [defaultService] : [])]))
+    : Array.from(new Set([...FALLBACK_SERVICES, ...(defaultService ? [defaultService] : [])]));
 
   const [form, setForm] = useState({
     name: "",
     phone: "",
     email: "",
-    service: "",
+    service: defaultService,
     city: "Guntur",
-    message: ""
+    message: "",
+    // honeypot — must stay empty
+    company_website: "",
   });
 
-  const update = (k: string, v: string) => {
-    setForm((prev) => ({ ...prev, [k]: v }));
-  };
+  const update = (k: string, v: string) => setForm((prev) => ({ ...prev, [k]: v }));
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     const parsed = schema.safeParse(form);
-
     if (!parsed.success) {
-      const fe: any = {};
+      const fe: Record<string, string> = {};
       parsed.error.issues.forEach((i) => {
-        fe[i.path[0]] = i.message;
+        fe[String(i.path[0])] = i.message;
       });
       setErrors(fe);
       return;
@@ -72,68 +81,59 @@ export default function LeadForm() {
     setLoading(true);
 
     try {
-      // 🔥 Save to Firebase
-      await addDoc(collection(db, "leads"), {
-        ...form,
-        createdAt: new Date()
+      const { data, error } = await supabase.functions.invoke("submit-lead", {
+        body: {
+          ...parsed.data,
+          source,
+          honeypot: form.company_website,
+          page_path: typeof window !== "undefined" ? window.location.pathname : null,
+        },
       });
 
-      // 🔥 Send Email
-      await emailjs.send(
-        "YOUR_SERVICE_ID",
-        "YOUR_TEMPLATE_ID",
-        {
-          name: form.name,
-          phone: form.phone,
-          email: form.email,
-          service: form.service,
-          city: form.city,
-          message: form.message
-        },
-        "YOUR_PUBLIC_KEY"
-      );
+      if (error) throw error;
+      if (data && (data as { error?: string }).error) {
+        throw new Error((data as { error?: string }).error);
+      }
 
       setSubmitted(true);
-
       toast({
-        title: "Success",
-        description: "We will contact you soon"
+        title: "Enquiry received",
+        description: "Our team will contact you shortly.",
       });
-
     } catch (err) {
-      console.error("Submission error:", err);
+      console.error("Lead submission error:", err);
       toast({
-        title: "Error",
-        description: "Submission failed. Try again."
+        title: "Submission failed",
+        description: "Please try again in a moment, or reach us on WhatsApp.",
+        variant: "destructive",
       });
+    } finally {
+      setLoading(false);
     }
-
-    setLoading(false);
   };
 
   if (submitted) {
     return (
-      <div className="p-6 text-center border rounded-xl">
-        <CheckCircle2 className="mx-auto text-green-600 mb-3" />
+      <div className="p-8 text-center border rounded-xl bg-card">
+        <CheckCircle2 className="mx-auto text-primary mb-3 h-10 w-10" />
         <h3 className="text-xl font-bold">Thank You!</h3>
-        <p>Our team will contact you soon.</p>
+        <p className="text-muted-foreground mt-1">Our team will contact you soon.</p>
       </div>
     );
   }
 
   return (
     <form onSubmit={onSubmit} className="space-y-4">
-
       <Field label="Name" error={errors.name}>
-        <Input value={form.name} onChange={(e) => update("name", e.target.value)} />
+        <Input value={form.name} onChange={(e) => update("name", e.target.value)} autoComplete="name" />
       </Field>
 
       <Field label="Phone" error={errors.phone}>
-        <Input value={form.phone} onChange={(e) => update("phone", e.target.value)} />
+        <Input value={form.phone} onChange={(e) => update("phone", e.target.value)} inputMode="numeric" autoComplete="tel" />
       </Field>
 
-      <Field label="Email">
-        <Input value={form.email} onChange={(e) => update("email", e.target.value)} />
+      <Field label="Email" error={errors.email}>
+        <Input value={form.email} onChange={(e) => update("email", e.target.value)} autoComplete="email" />
       </Field>
 
       <Field label="City">
@@ -141,13 +141,15 @@ export default function LeadForm() {
       </Field>
 
       <Field label="Service" error={errors.service}>
-        <Select onValueChange={(v) => update("service", v)}>
+        <Select value={form.service} onValueChange={(v) => update("service", v)}>
           <SelectTrigger>
             <SelectValue placeholder="Select service" />
           </SelectTrigger>
           <SelectContent>
-            {SERVICES.map((s) => (
-              <SelectItem key={s} value={s}>{s}</SelectItem>
+            {options.map((s) => (
+              <SelectItem key={s} value={s}>
+                {s}
+              </SelectItem>
             ))}
           </SelectContent>
         </Select>
@@ -157,21 +159,41 @@ export default function LeadForm() {
         <Textarea value={form.message} onChange={(e) => update("message", e.target.value)} />
       </Field>
 
-      <Button type="submit" disabled={loading} className="w-full">
+      {/* Honeypot: hidden from users, bots fill it */}
+      <div className="hidden" aria-hidden="true">
+        <label htmlFor="company_website">Company website</label>
+        <input
+          id="company_website"
+          name="company_website"
+          tabIndex={-1}
+          autoComplete="off"
+          value={form.company_website}
+          onChange={(e) => update("company_website", e.target.value)}
+        />
+      </div>
+
+      <Button type="submit" disabled={loading} className="w-full" size="lg">
         <Send className="mr-2 h-4 w-4" />
         {loading ? "Submitting..." : "Get Quote"}
       </Button>
-
     </form>
   );
 }
 
-function Field({ label, error, children }: any) {
+function Field({
+  label,
+  error,
+  children,
+}: {
+  label: string;
+  error?: string;
+  children: React.ReactNode;
+}) {
   return (
-    <div>
+    <div className="space-y-1.5">
       <Label>{label}</Label>
       {children}
-      {error && <p className="text-red-500 text-sm">{error}</p>}
+      {error && <p className="text-destructive text-sm">{error}</p>}
     </div>
   );
 }
